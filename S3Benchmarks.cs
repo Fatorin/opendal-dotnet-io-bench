@@ -124,4 +124,16 @@ public class S3Benchmarks
     [Benchmark]
     [BenchmarkCategory("s3-write")]
     public Task OpenDAL_WriteAsync() => op.WriteAsync("bench-write-opendal.bin", payload);
+
+    [Benchmark]
+    [BenchmarkCategory("s3-write")]
+    public Task OpenDAL_WriteCallback() =>
+        op.WriteAsync(
+            "bench-write-opendal-fill.bin",
+            writer =>
+            {
+                payload.CopyTo(writer.GetSpan(payload.Length));
+                writer.Advance(payload.Length);
+            },
+            sizeHint: payload.Length);
 }

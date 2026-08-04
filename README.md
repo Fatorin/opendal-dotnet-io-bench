@@ -14,7 +14,7 @@ Both stacks operate on the same temp directory and the same payload file, so eve
 | write | `File.WriteAllBytes` | `Operator.Write` (byte[]), `Operator.Write` (fill callback) |
 | write-async | `File.WriteAllBytesAsync` | `Operator.WriteAsync` |
 | s3-read | `AWSSDK.S3` `GetObjectAsync` into a byte[] | `Operator.ReadAsync` (byte[]), `Operator.ReadAsync<T>` (sequence callback) |
-| s3-write | `AWSSDK.S3` `PutObjectAsync` | `Operator.WriteAsync` |
+| s3-write | `AWSSDK.S3` `PutObjectAsync` | `Operator.WriteAsync` (byte[], fill callback) |
 
 Payload sizes: 16 KiB, 16 MiB, 128 MiB.
 
@@ -101,7 +101,7 @@ Gen0/Gen1/Gen2 columns omitted here for width, the full BenchmarkDotNet report l
 
 Same rig, both clients at their defaults, loopback MinIO. Here the comparison flips: **opendal is faster than the AWS SDK at every size in both directions**.
 
-- Reads land at 0.44-0.52x of the SDK's time from 16 MiB up (about 2x faster), writes at 0.63-0.65x (about 1.5x faster), and even the 16 KiB rows come in ahead.
+- Reads land at 0.44-0.52x of the SDK's time from 16 MiB up (about 2x faster). Writes range from 0.55x at 16 MiB to 0.86x at 128 MiB with the `byte[]` and fill-callback forms close together, and the 16 KiB rows come in ahead in both directions. The write rows come from a later run that adds the fill-callback variant, and MinIO drifts between runs on this rig, so compare ratios within a table rather than absolute times across tables. The 128 MiB writes carry ±25-35% error bars.
 - The allocation gap is bigger than the throughput gap. The SDK allocates about 2.4x the payload per read (internal buffering) and megabytes per large write, while the opendal `byte[]` read allocates exactly the payload and its writes stay under 2 KB. The sequence-callback read stays in the kilobytes at every size. Part of the gap likely comes from the SDK's payload signing and buffering at default settings.
 - The fixed per-operation cost from the fs suite is invisible here — HTTP round trips dominate, and object storage is the binding's actual target scenario.
 
@@ -116,12 +116,15 @@ Same rig, both clients at their defaults, loopback MinIO. Here the comparison fl
 | AwsS3_GetObject      | s3-read    | 128 MiB   | 282,113.8 μs |   2,263.35 μs |   1,183.78 μs |  1.00 |    0.01 | 318868456 B |       1.000 |
 | OpenDAL_ReadAsync    | s3-read    | 128 MiB   | 147,726.1 μs |   5,600.69 μs |   2,929.27 μs |  0.52 |    0.01 | 134409229 B |       0.422 |
 | OpenDAL_ReadCallback | s3-read    | 128 MiB   | 136,235.5 μs |   7,979.66 μs |   5,278.05 μs |  0.48 |    0.02 |    192530 B |       0.001 |
-| AwsS3_PutObject      | s3-write   | 16 KiB    |   5,490.5 μs |     428.37 μs |     283.34 μs |  1.00 |    0.07 |    277150 B |       1.000 |
-| OpenDAL_WriteAsync   | s3-write   | 16 KiB    |   4,792.9 μs |     510.01 μs |     337.34 μs |  0.88 |    0.07 |       379 B |       0.001 |
-| AwsS3_PutObject      | s3-write   | 16 MiB    |  89,082.5 μs |   7,094.81 μs |   3,710.72 μs |  1.00 |    0.06 |   2089707 B |       1.000 |
-| OpenDAL_WriteAsync   | s3-write   | 16 MiB    |  57,857.9 μs |   4,714.87 μs |   2,805.75 μs |  0.65 |    0.04 |       519 B |       0.000 |
-| AwsS3_PutObject      | s3-write   | 128 MiB   | 803,726.2 μs | 152,237.06 μs | 100,695.39 μs |  1.01 |    0.16 |  14445016 B |       1.000 |
-| OpenDAL_WriteAsync   | s3-write   | 128 MiB   | 496,327.9 μs |  47,016.27 μs |  24,590.42 μs |  0.63 |    0.07 |      1728 B |       0.000 |
+| AwsS3_PutObject       | s3-write   | 16 KiB    |   7,103.0 μs |   1,673.90 μs |   1,107.20 μs |  1.02 |    0.21 |    277172 B |       1.000 |
+| OpenDAL_WriteAsync    | s3-write   | 16 KiB    |   4,903.0 μs |     141.80 μs |      84.40 μs |  0.71 |    0.10 |       379 B |       0.001 |
+| OpenDAL_WriteCallback | s3-write   | 16 KiB    |   5,015.0 μs |     260.70 μs |     172.50 μs |  0.72 |    0.11 |       683 B |       0.002 |
+| AwsS3_PutObject       | s3-write   | 16 MiB    | 103,657.0 μs |  11,230.30 μs |   7,428.20 μs |  1.00 |    0.10 |   2088358 B |       1.000 |
+| OpenDAL_WriteAsync    | s3-write   | 16 MiB    |  56,404.0 μs |   3,236.60 μs |   1,926.00 μs |  0.55 |    0.04 |       551 B |       0.000 |
+| OpenDAL_WriteCallback | s3-write   | 16 MiB    |  65,911.0 μs |  12,594.30 μs |   7,494.70 μs |  0.64 |    0.08 |       879 B |       0.000 |
+| AwsS3_PutObject       | s3-write   | 128 MiB   | 919,058.0 μs | 292,904.10 μs | 193,738.00 μs |  1.04 |    0.29 |  14445016 B |       1.000 |
+| OpenDAL_WriteAsync    | s3-write   | 128 MiB   | 765,858.0 μs | 428,374.10 μs | 283,342.90 μs |  0.87 |    0.35 |      1728 B |       0.000 |
+| OpenDAL_WriteCallback | s3-write   | 128 MiB   | 759,358.0 μs | 263,661.90 μs | 174,396.00 μs |  0.86 |    0.25 |      2032 B |       0.000 |
 
 ## Reading the numbers
 
