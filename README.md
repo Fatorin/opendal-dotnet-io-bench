@@ -18,7 +18,7 @@ Payload sizes: 16 KiB, 16 MiB, 128 MiB.
 
 ## Methodology
 
-- [BenchmarkDotNet](https://benchmarkdotnet.org/) with the in-process toolchain (the native library loads once), 2 warmup + 8 measured iterations, `MemoryDiagnoser` for managed allocations. The write categories were re-measured with `--filter "*Write*" --iterationCount 20 --warmupCount 3` because OS write-back makes Windows disk writes noisy.
+- [BenchmarkDotNet](https://benchmarkdotnet.org/) with the in-process toolchain (the native library loads once), 2 warmup + 8 measured iterations, `MemoryDiagnoser` for managed allocations. The write categories were re-measured with `--filter "*Write*" --iterationCount 20 --warmupCount 3` because OS write-back makes Windows disk writes noisy, and the write-async category was additionally run in isolation (`--filter "*Write*Async*"`) so the preceding 128 MiB sync-write cases' flushing stays out of its rows.
 - The read target file is written once during setup, so reads are served from the OS page cache **by design**: the comparison isolates API and FFI overhead, not disk speed.
 - Writes go to separate files per method inside the same directory. Neither stack issues fsync.
 - The System.IO method in each category is the BenchmarkDotNet baseline, so the `Ratio` column reads directly as "opendal cost relative to native".
@@ -45,8 +45,8 @@ Highlights from the run below:
 - **The binding pays a fixed per-operation cost** — roughly 0.1 to 0.4 ms of FFI transitions plus async-runtime dispatch that `System.IO` never pays. On 16 KiB payloads that fixed cost is the whole story and the ratios run 2.6x to 13.8x in favor of `System.IO`.
 - **Streaming closes the gap completely.** The chunked read pair goes from 4.2x at 16 KiB to 1.12x at 16 MiB, and at 128 MiB the opendal stream is *faster* than `FileStream` (0.91x) while allocating less than half as much per pass.
 - **One-shot reads settle at 1.5x to 2x for large payloads.** The sequence-callback form is the cheaper opendal option at every size, 1.55x at 128 MiB while allocating 6 KB instead of 134 MB.
-- **Writes converge as the disk takes over.** Roughly 5x at 16 MiB (where `File.WriteAllBytes` is a pure page-cache dump) narrows to about 1.4x at 128 MiB once OS write-back throttles both stacks, with the `byte[]` and fill-callback forms landing equal there.
-- **Windows disk-write rows are noisy.** The write categories use 20 measured iterations against 8 for reads, and the 128 MiB rows still carry error bars around ±25% of the mean, so read those ratios as ranges. BenchmarkDotNet also runs the cases sequentially, so later write cases face more accumulated dirty pages than earlier ones. One oddity reproduced across two independent runs without being root-caused: the async 16 MiB write sits near 9x while its sync twin is 5x and its own 128 MiB neighbor is 1.4x.
+- **Writes converge as the disk takes over.** Roughly 5x at 16 MiB (where `File.WriteAllBytes` is a pure page-cache dump) narrows to roughly 1.4-1.7x at 128 MiB once OS write-back throttles both stacks, with the `byte[]` and fill-callback forms landing equal there.
+- **Windows disk-write rows are noisy.** The write categories use 20 measured iterations against 8 for reads, and the 128 MiB rows still carry error bars around ±25% of the mean, so read those ratios as ranges. BenchmarkDotNet also runs the cases sequentially, so a case that follows the 128 MiB writes inherits their write-back flushing: full-suite runs put the async 16 MiB write near 9x for exactly that reason, while a paired sync/async/`Task.Run` trace shows the three paths within 1% of each other at every size from 1 to 128 MiB. The write-async rows above therefore come from an isolated run of that category, where async lands next to its sync twin (5.4x vs 5.0x at 16 MiB). The trace ships in this repo — reproduce it with `dotnet run -c Release -- write-trace`.
 
 | Method                  | Categories  | SizeBytes | Mean          | Error          | StdDev        | Ratio | RatioSD | Allocated   | Alloc Ratio |
 |------------------------ |------------ |---------- |--------------:|---------------:|--------------:|------:|--------:|------------:|------------:|
@@ -80,12 +80,12 @@ Highlights from the run below:
 | File_WriteAllBytes      | write       | 128 MiB   | 202,122.00 μs |  46,356.900 μs | 53,384.700 μs |  1.06 |    0.37 |       371 B |        1.00 |
 | OpenDAL_Write           | write       | 128 MiB   | 269,984.00 μs |  47,886.200 μs | 55,145.800 μs |  1.42 |    0.44 |       344 B |        0.93 |
 | OpenDAL_WriteCallback   | write       | 128 MiB   | 274,520.00 μs |  46,524.100 μs | 53,577.200 μs |  1.44 |    0.44 |       472 B |        1.27 |
-| File_WriteAllBytesAsync | write-async | 16 KiB    |   2,106.00 μs |      87.500 μs |     97.200 μs |  1.00 |    0.06 |       604 B |        1.00 |
-| OpenDAL_WriteAsync      | write-async | 16 KiB    |   4,014.00 μs |      67.900 μs |     75.500 μs |  1.91 |    0.09 |       373 B |        0.62 |
-| File_WriteAllBytesAsync | write-async | 16 MiB    |   4,727.00 μs |     307.900 μs |    329.400 μs |  1.00 |    0.09 |       607 B |        1.00 |
-| OpenDAL_WriteAsync      | write-async | 16 MiB    |  42,053.00 μs |   7,482.600 μs |  8,617.000 μs |  8.93 |    1.88 |       411 B |        0.68 |
-| File_WriteAllBytesAsync | write-async | 128 MiB   | 217,938.00 μs |  50,104.400 μs | 57,700.300 μs |  1.07 |    0.41 |       899 B |        1.00 |
-| OpenDAL_WriteAsync      | write-async | 128 MiB   | 281,108.00 μs |  43,411.900 μs | 49,993.300 μs |  1.38 |    0.45 |       693 B |        0.77 |
+| File_WriteAllBytesAsync | write-async | 16 KiB    |   2,013.00 μs |      66.400 μs |     68.200 μs |  1.00 |    0.05 |       604 B |        1.00 |
+| OpenDAL_WriteAsync      | write-async | 16 KiB    |   3,949.00 μs |      85.000 μs |     87.300 μs |  1.96 |    0.08 |       373 B |        0.62 |
+| File_WriteAllBytesAsync | write-async | 16 MiB    |   4,647.00 μs |     341.400 μs |    379.500 μs |  1.01 |    0.11 |       607 B |        1.00 |
+| OpenDAL_WriteAsync      | write-async | 16 MiB    |  24,963.00 μs |   1,445.200 μs |  1,546.300 μs |  5.40 |    0.53 |       390 B |        0.64 |
+| File_WriteAllBytesAsync | write-async | 128 MiB   | 160,591.00 μs |   5,437.000 μs |  5,583.400 μs |  1.00 |    0.05 |       995 B |        1.00 |
+| OpenDAL_WriteAsync      | write-async | 128 MiB   | 269,592.00 μs |  39,503.400 μs | 45,492.200 μs |  1.68 |    0.28 |       597 B |        0.60 |
 
 Gen0/Gen1/Gen2 columns omitted here for width, the full BenchmarkDotNet report lands in `BenchmarkDotNet.Artifacts/results/` when you run it yourself.
 
