@@ -2,7 +2,7 @@
 
 Micro-benchmarks comparing the [Apache OpenDAL](https://github.com/apache/opendal) .NET binding against `System.IO` on the local filesystem. Written to answer a review question on the binding's FFI-boundary rework PR: *"how does the opendal binding's performance compare with dotnet's native IO?"*
 
-Both stacks operate on the same temp directory and the same payload file, so every row is an apples-to-apples pair: the opendal `fs` service (Rust `std::fs` behind the FFI boundary) versus the closest `System.IO` equivalent.
+Both stacks operate on the same temp directory and the same payload file, so every row is an apples-to-apples pair: the opendal `fs` service (Rust `std::fs` behind the FFI boundary) versus the closest `System.IO` equivalent. A second suite runs the same idea over object storage: the opendal `s3` service versus `AWSSDK.S3`, both talking to the same local MinIO over loopback.
 
 ## What it measures
 
@@ -13,6 +13,8 @@ Both stacks operate on the same temp directory and the same payload file, so eve
 | read-async | `File.ReadAllBytesAsync` | `Operator.ReadAsync` |
 | write | `File.WriteAllBytes` | `Operator.Write` (byte[]), `Operator.Write` (fill callback) |
 | write-async | `File.WriteAllBytesAsync` | `Operator.WriteAsync` |
+| s3-read | `AWSSDK.S3` `GetObjectAsync` into a byte[] | `Operator.ReadAsync` (byte[]), `Operator.ReadAsync<T>` (sequence callback) |
+| s3-write | `AWSSDK.S3` `PutObjectAsync` | `Operator.WriteAsync` |
 
 Payload sizes: 16 KiB, 16 MiB, 128 MiB.
 
@@ -21,7 +23,8 @@ Payload sizes: 16 KiB, 16 MiB, 128 MiB.
 - [BenchmarkDotNet](https://benchmarkdotnet.org/) with the in-process toolchain (the native library loads once), 2 warmup + 8 measured iterations, `MemoryDiagnoser` for managed allocations. The write categories were re-measured with `--filter "*Write*" --iterationCount 20 --warmupCount 3` because OS write-back makes Windows disk writes noisy, and the write-async category was additionally run in isolation (`--filter "*Write*Async*"`) so the preceding 128 MiB sync-write cases' flushing stays out of its rows.
 - The read target file is written once during setup, so reads are served from the OS page cache **by design**: the comparison isolates API and FFI overhead, not disk speed.
 - Writes go to separate files per method inside the same directory. Neither stack issues fsync.
-- The System.IO method in each category is the BenchmarkDotNet baseline, so the `Ratio` column reads directly as "opendal cost relative to native".
+- The System.IO method in each category is the BenchmarkDotNet baseline, so the `Ratio` column reads directly as "opendal cost relative to native". In the s3 suite the `AWSSDK.S3` method plays that role.
+- The s3 suite runs both clients at their default configuration against the same MinIO instance over plain HTTP loopback, with 2 warmup + 10 measured iterations.
 
 ## Running it
 
@@ -34,7 +37,12 @@ parent/
 ```
 
 1. Build the binding's native library: `cargo build --release` inside `opendal/bindings/dotnet`.
-2. `dotnet run -c Release -- --filter "*"` inside this repo.
+2. `dotnet run -c Release -- --filter "*IoBenchmarks*"` for the `System.IO` suite.
+3. For the s3 suite, start MinIO first, then `dotnet run -c Release -- --filter "*S3Benchmarks*"`. The bucket is created automatically:
+
+```
+docker run -d --name minio -p 9000:9000 -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin quay.io/minio/minio server /data
+```
 
 Results land in `BenchmarkDotNet.Artifacts/results/`.
 
@@ -89,6 +97,32 @@ Highlights from the run below:
 
 Gen0/Gen1/Gen2 columns omitted here for width, the full BenchmarkDotNet report lands in `BenchmarkDotNet.Artifacts/results/` when you run it yourself.
 
+### s3 against AWSSDK.S3 (MinIO)
+
+Same rig, both clients at their defaults, loopback MinIO. Here the comparison flips: **opendal is faster than the AWS SDK at every size in both directions**.
+
+- Reads land at 0.44-0.52x of the SDK's time from 16 MiB up (about 2x faster), writes at 0.63-0.65x (about 1.5x faster), and even the 16 KiB rows come in ahead.
+- The allocation gap is bigger than the throughput gap. The SDK allocates about 2.4x the payload per read (internal buffering) and megabytes per large write, while the opendal `byte[]` read allocates exactly the payload and its writes stay under 2 KB. The sequence-callback read stays in the kilobytes at every size. Part of the gap likely comes from the SDK's payload signing and buffering at default settings.
+- The fixed per-operation cost from the fs suite is invisible here — HTTP round trips dominate, and object storage is the binding's actual target scenario.
+
+| Method               | Categories | SizeBytes | Mean         | Error         | StdDev        | Ratio | RatioSD | Allocated   | Alloc Ratio |
+|--------------------- |----------- |---------- |-------------:|--------------:|--------------:|------:|--------:|------------:|------------:|
+| AwsS3_GetObject      | s3-read    | 16 KiB    |     847.0 μs |     137.70 μs |      81.95 μs |  1.01 |    0.12 |    107616 B |       1.000 |
+| OpenDAL_ReadAsync    | s3-read    | 16 KiB    |     691.7 μs |      24.19 μs |      16.00 μs |  0.82 |    0.07 |     17290 B |       0.161 |
+| OpenDAL_ReadCallback | s3-read    | 16 KiB    |     686.3 μs |       7.70 μs |       5.09 μs |  0.82 |    0.07 |       884 B |       0.008 |
+| AwsS3_GetObject      | s3-read    | 16 MiB    |  41,144.2 μs |   4,342.02 μs |   2,871.98 μs |  1.00 |    0.09 |  39922256 B |       1.000 |
+| OpenDAL_ReadAsync    | s3-read    | 16 MiB    |  20,530.0 μs |   1,423.74 μs |     744.64 μs |  0.50 |    0.04 |  16803497 B |       0.421 |
+| OpenDAL_ReadCallback | s3-read    | 16 MiB    |  17,862.7 μs |   1,340.87 μs |     886.90 μs |  0.44 |    0.03 |     24550 B |       0.001 |
+| AwsS3_GetObject      | s3-read    | 128 MiB   | 282,113.8 μs |   2,263.35 μs |   1,183.78 μs |  1.00 |    0.01 | 318868456 B |       1.000 |
+| OpenDAL_ReadAsync    | s3-read    | 128 MiB   | 147,726.1 μs |   5,600.69 μs |   2,929.27 μs |  0.52 |    0.01 | 134409229 B |       0.422 |
+| OpenDAL_ReadCallback | s3-read    | 128 MiB   | 136,235.5 μs |   7,979.66 μs |   5,278.05 μs |  0.48 |    0.02 |    192530 B |       0.001 |
+| AwsS3_PutObject      | s3-write   | 16 KiB    |   5,490.5 μs |     428.37 μs |     283.34 μs |  1.00 |    0.07 |    277150 B |       1.000 |
+| OpenDAL_WriteAsync   | s3-write   | 16 KiB    |   4,792.9 μs |     510.01 μs |     337.34 μs |  0.88 |    0.07 |       379 B |       0.001 |
+| AwsS3_PutObject      | s3-write   | 16 MiB    |  89,082.5 μs |   7,094.81 μs |   3,710.72 μs |  1.00 |    0.06 |   2089707 B |       1.000 |
+| OpenDAL_WriteAsync   | s3-write   | 16 MiB    |  57,857.9 μs |   4,714.87 μs |   2,805.75 μs |  0.65 |    0.04 |       519 B |       0.000 |
+| AwsS3_PutObject      | s3-write   | 128 MiB   | 803,726.2 μs | 152,237.06 μs | 100,695.39 μs |  1.01 |    0.16 |  14445016 B |       1.000 |
+| OpenDAL_WriteAsync   | s3-write   | 128 MiB   | 496,327.9 μs |  47,016.27 μs |  24,590.42 μs |  0.63 |    0.07 |      1728 B |       0.000 |
+
 ## Reading the numbers
 
 - The gap between the two stacks is a fixed per-operation cost (FFI transitions, and for async the executor dispatch), so it is most visible at 16 KiB and fades as the payload grows and memcpy/IO dominates.
@@ -96,4 +130,4 @@ Gen0/Gen1/Gen2 columns omitted here for width, the full BenchmarkDotNet report l
 
 ## Environment
 
-AMD Ryzen 5 9600X (6C/12T), 32 GB DDR5-4800, NVMe SSD, Windows 11, .NET 8.0.29 host, BenchmarkDotNet v0.14.0, opendal binding built at the `dotnet-ffi-refactor-perf` branch in release mode.
+AMD Ryzen 5 9600X (6C/12T), 32 GB DDR5-4800, NVMe SSD, Windows 11, .NET 8.0.29 host, BenchmarkDotNet v0.14.0, opendal binding built at the `dotnet-ffi-refactor-perf` branch in release mode. The s3 suite runs against a single-node MinIO container with AWSSDK.S3 3.7.511.
