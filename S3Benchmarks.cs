@@ -31,7 +31,8 @@ public class S3Benchmarks
         }
     }
 
-    private const string Endpoint = "http://127.0.0.1:9000";
+    private static readonly string Endpoint =
+        Environment.GetEnvironmentVariable("MINIO_ENDPOINT") ?? "http://127.0.0.1:9000";
     private const string AccessKey = "minioadmin";
     private const string SecretKey = "minioadmin";
     private const string Bucket = "bench";
